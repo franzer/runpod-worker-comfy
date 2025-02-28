@@ -174,6 +174,7 @@ The following describes which fields exist when doing requests to the API. We on
 | `input`          | Object | Yes      | The top-level object containing the request data.                                                                                         |
 | `input.workflow` | Object | Yes      | Contains the ComfyUI workflow configuration.                                                                                              |
 | `input.images`   | Array  | No       | An array of images. Each image will be added into the "input"-folder of ComfyUI and can then be used in the workflow by using it's `name` |
+| `input.user_id`  | String | No       | User identifier used to organize images in storage. If not provided, defaults to "anonymous".                                             |
 
 #### "input.images"
 

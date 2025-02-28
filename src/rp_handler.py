@@ -27,13 +27,6 @@ REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
 def validate_input(job_input):
     """
     Validates the input for the handler function.
-
-    Args:
-        job_input (dict): The input data to validate.
-
-    Returns:
-        tuple: A tuple containing the validated data and an error message, if any.
-               The structure is (validated_data, error_message).
     """
     # Validate if job_input is provided
     if job_input is None:
@@ -61,10 +54,14 @@ def validate_input(job_input):
                 None,
                 "'images' must be a list of objects with 'name' and 'image' keys",
             )
+    
+    # Validate user_id (optional)
+    user_id = job_input.get("user_id", "default-user")
+    if not isinstance(user_id, str):
+        return None, "'user_id' must be a string"
 
     # Return validated data and no error
-    return {"workflow": workflow, "images": images}, None
-
+    return {"workflow": workflow, "images": images, "user_id": user_id}, None
 
 def check_server(url, retries=500, delay=50):
     """
@@ -200,35 +197,10 @@ def base64_encode(img_path):
         return f"{encoded_string}"
 
 
-def process_output_images(outputs, job_id):
+def process_output_images(outputs, job_id, user_id="anonymous"):
     """
-    This function takes the "outputs" from image generation and the job ID,
-    then determines the correct way to return the image, either as a direct URL
-    to an AWS S3 bucket or as a base64 encoded string, depending on the
-    environment configuration.
-
-    Args:
-        outputs (dict): A dictionary containing the outputs from image generation,
-                        typically includes node IDs and their respective output data.
-        job_id (str): The unique identifier for the job.
-
-    Returns:
-        dict: A dictionary with the status ('success' or 'error') and the message,
-              which is either the URL to the image in the AWS S3 bucket or a base64
-              encoded string of the image. In case of error, the message details the issue.
-
-    The function works as follows:
-    - It first determines the output path for the images from an environment variable,
-      defaulting to "/comfyui/output" if not set.
-    - It then iterates through the outputs to find the filenames of the generated images.
-    - After confirming the existence of the image in the output folder, it checks if the
-      AWS S3 bucket is configured via the BUCKET_ENDPOINT_URL environment variable.
-    - If AWS S3 is configured, it uploads the image to the bucket and returns the URL.
-    - If AWS S3 is not configured, it encodes the image in base64 and returns the string.
-    - If the image file does not exist in the output folder, it returns an error status
-      with a message indicating the missing image file.
+    Process output images from ComfyUI and either upload to R2 or encode as base64
     """
-
     # The path where ComfyUI stores the generated images
     COMFY_OUTPUT_PATH = os.environ.get("COMFY_OUTPUT_PATH", "/comfyui/output")
 
@@ -248,23 +220,63 @@ def process_output_images(outputs, job_id):
 
     # The image is in the output folder
     if os.path.exists(local_image_path):
-        if os.environ.get("BUCKET_ENDPOINT_URL", False):
-            # URL to image in AWS S3
-            image = rp_upload.upload_image(job_id, local_image_path)
-            print(
-                "runpod-worker-comfy - the image was generated and uploaded to AWS S3"
-            )
+        if os.environ.get("R2_ENDPOINT", False):
+            # Upload to R2
+            try:
+                # Generate a unique path for the image
+                image_id = str(uuid.uuid4())
+                image_path = f"{user_id}/{image_id}.png"
+                
+                # Get S3 client for R2
+                s3 = boto3.client(
+                    's3',
+                    endpoint_url=os.environ.get('R2_ENDPOINT'),
+                    aws_access_key_id=os.environ.get('R2_ACCESS_KEY_ID'),
+                    aws_secret_access_key=os.environ.get('R2_SECRET_ACCESS_KEY')
+                )
+                
+                # Upload to R2
+                with open(local_image_path, 'rb') as file_data:
+                    s3.upload_fileobj(
+                        file_data,
+                        os.environ.get('IMAGES_BUCKET'),
+                        image_path,
+                        ExtraArgs={'ContentType': 'image/png'}
+                    )
+                
+                # Build the full R2 URL (optional)
+                r2_endpoint = os.environ.get('R2_ENDPOINT')
+                bucket_name = os.environ.get('IMAGES_BUCKET')
+                if r2_endpoint.endswith('/'):
+                    r2_endpoint = r2_endpoint[:-1]
+                    
+                image_url = f"{r2_endpoint}/{bucket_name}/{image_path}"
+                
+                print(f"runpod-worker-comfy - image uploaded to R2 for user {user_id}")
+                
+                # Return the R2 URL and path
+                return {
+                    "status": "success",
+                    "message": image_url,
+                    "image_path": image_path  # Include the path for database storage
+                }
+            except Exception as e:
+                print(f"runpod-worker-comfy - R2 upload failed: {str(e)}")
+                # Fall back to base64 if R2 upload fails
+                image = base64_encode(local_image_path)
+                return {
+                    "status": "error",
+                    "message": f"R2 upload failed: {str(e)}. Falling back to base64 image.",
+                    "image": image
+                }
         else:
             # base64 image
             image = base64_encode(local_image_path)
-            print(
-                "runpod-worker-comfy - the image was generated and converted to base64"
-            )
-
-        return {
-            "status": "success",
-            "message": image,
-        }
+            print("runpod-worker-comfy - the image was generated and converted to base64")
+            return {
+                "status": "success",
+                "message": image,
+            }
     else:
         print("runpod-worker-comfy - the image does not exist in the output folder")
         return {
@@ -272,31 +284,24 @@ def process_output_images(outputs, job_id):
             "message": f"the image does not exist in the specified output folder: {local_image_path}",
         }
 
-
 def handler(job):
     """
     The main function that handles a job of generating an image.
-
-    This function validates the input, sends a prompt to ComfyUI for processing,
-    polls ComfyUI for result, and retrieves generated images.
-
-    Args:
-        job (dict): A dictionary containing job details and input parameters.
-
-    Returns:
-        dict: A dictionary containing either an error message or a success status with generated images.
     """
     job_input = job["input"]
-
+    
     # Make sure that the input is valid
     validated_data, error_message = validate_input(job_input)
     if error_message:
         return {"error": error_message}
-
+    
     # Extract validated data
     workflow = validated_data["workflow"]
     images = validated_data.get("images")
-
+    
+    # Extract user_id from input, default to "default-user" if not provided
+    user_id = job_input.get("user_id", "default-user")
+    
     # Make sure that the ComfyUI API is available
     check_server(
         f"http://{COMFY_HOST}",
@@ -337,13 +342,13 @@ def handler(job):
     except Exception as e:
         return {"error": f"Error waiting for image generation: {str(e)}"}
 
-    # Get the generated image and return it as URL in an AWS bucket or as base64
-    images_result = process_output_images(history[prompt_id].get("outputs"), job["id"])
+    # Get the generated image and return it as URL in R2 or as base64
+    # Pass the user_id to process_output_images
+    images_result = process_output_images(history[prompt_id].get("outputs"), job["id"], user_id)
 
     result = {**images_result, "refresh_worker": REFRESH_WORKER}
 
     return result
-
 
 # Start the handler only if this script is run directly
 if __name__ == "__main__":
