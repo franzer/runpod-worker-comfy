@@ -7,7 +7,9 @@ import time
 import os
 import requests
 import base64
+import uuid
 from io import BytesIO
+import boto3
 
 # Time to wait between API check attempts in milliseconds
 COMFY_API_AVAILABLE_INTERVAL_MS = 50

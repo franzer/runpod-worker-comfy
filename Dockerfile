@@ -46,7 +46,7 @@ ADD src/start.sh src/restore_snapshot.sh src/rp_handler.py test_input.json ./
 RUN chmod +x /start.sh /restore_snapshot.sh
 
 # Optionally copy the snapshot file
-ADD *snapshot*.json /
+# ADD *snapshot*.json /
 
 # Restore the snapshot to install custom nodes
 RUN /restore_snapshot.sh
